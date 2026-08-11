@@ -1,5 +1,6 @@
 import sys
 import pickle
+from concurrent.futures import ThreadPoolExecutor
 
 import dlib
 import pytest
@@ -56,7 +57,14 @@ def test_regression_issue_1220_get_face_chip():
     # we expect two references:
     # 1.) the local variable
     # 2.) the temporary passed to getrefcount
-    assert sys.getrefcount(face_chip) == 2
+    #
+    # Python 3.14 has changed the way references are counted (borrowed references)
+    # https://docs.python.org/3.14/whatsnew/3.14.html#limited-c-api-changes
+    # https://github.com/davisking/dlib/issues/3096
+    if sys.version_info < (3, 14):
+        assert sys.getrefcount(face_chip) == 2
+    else:
+        assert sys.getrefcount(face_chip) == 1
 
 
 @pytest.mark.skipif(not utils.is_numpy_installed(), reason="requires numpy")
@@ -67,6 +75,22 @@ def test_regression_issue_1220_get_face_chips():
     """
     face_chips = get_test_face_chips()
     count = sys.getrefcount(face_chips)
-    assert count == 2
+    # Python 3.14 has changed the way references are counted (borrowed references)
+    # https://docs.python.org/3.14/whatsnew/3.14.html#limited-c-api-changes
+    # https://github.com/davisking/dlib/issues/3096
+    if sys.version_info < (3, 14):
+        assert count == 2
+    else:
+        assert count == 1
     count = sys.getrefcount(face_chips[0])
     assert count == 2
+
+
+@pytest.mark.skipif(not utils.is_numpy_installed(), reason="requires numpy")
+def test_jitter_image_from_multiple_threads():
+    img = get_test_face_chip()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _: dlib.jitter_image(img, 4, True), range(32)))
+
+    assert all(len(result) == 4 for result in results)

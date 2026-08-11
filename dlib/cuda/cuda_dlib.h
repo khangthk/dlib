@@ -25,6 +25,9 @@ namespace dlib
         int get_num_devices (
         );
 
+        bool use_cuda(
+        );
+
         std::string get_device_name (
             int device
         );
@@ -561,6 +564,23 @@ namespace dlib
             const tensor& gradient_input
         );
 
+    // -----------------------------------------------------------------------------------
+
+        void embeddings(
+            resizable_tensor& dest,
+            const tensor& src,
+            const tensor& embs
+        );
+
+        void embeddings_gradient(
+            const tensor& prev,
+            const tensor& gradient_input,
+            tensor& grads,
+            const tensor& freqs,
+            float learning_rate,
+            bool scale
+        );
+
     // ----------------------------------------------------------------------------------------
 
         void copy_tensor(
@@ -574,10 +594,71 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        void copy_tensor(
+            bool add_to,
+            tensor& dest,
+            size_t dk, size_t dnr, size_t dnc,
+            const tensor& src,
+            size_t sk, size_t snr, size_t snc,
+            size_t k, size_t nr, size_t nc
+        );
+ 
+    // ----------------------------------------------------------------------------------------
+
         void transpose(
             bool add_to,
             tensor& dest,
             const tensor& src
+        );
+
+    // ----------------------------------------------------------------------------------------
+
+        void compute_act_halt_probabilities(
+            resizable_tensor& halt_probs,
+            resizable_tensor& logits,
+            const tensor& input_data,
+            const tensor& halt_params,
+            long batch_size,
+            long seq_len,
+            long feature_dim
+        );
+
+        void update_act_state(
+            resizable_tensor& output,
+            const tensor& input_data,
+            const tensor& halt_probs,
+            resizable_tensor& cumulative_halting,
+            resizable_tensor& remainders,
+            resizable_tensor& n_steps,
+            resizable_tensor& effective_weights,
+            long batch_size,
+            long seq_len,
+            long d_model,
+            long num_channels,
+            float halt_threshold,
+            long current_step
+        );
+
+        void finalize_act_output(
+            resizable_tensor& output,
+            const tensor& input_data,
+            const tensor& remainders,
+            resizable_tensor& effective_weights,
+            long batch_size,
+            long seq_len,
+            long d_model,
+            long num_channels
+        );
+
+        void apply_act_depth_scaling(
+            tensor& gradients,
+            const tensor& n_steps,
+            long batch_size,
+            long seq_len,
+            long d_model,
+            long num_channels,
+            float max_steps,
+            float scale_factor
         );
 
     // ----------------------------------------------------------------------------------------
@@ -863,6 +944,9 @@ namespace dlib
 
         inline int get_num_devices (
         ) { return 1; }
+
+        inline bool use_cuda(
+        ) { return false; }
 
         inline std::string get_device_name (
             int device

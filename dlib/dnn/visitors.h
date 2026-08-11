@@ -797,6 +797,15 @@ namespace dlib
                 update(i);
             }
 
+            template <unsigned long no, linear_bias_mode bm, typename U, typename E>
+            void operator()(size_t i, const add_layer<linear_<no, bm>, U, E>& l)
+            {
+                start_node(i, "linear");
+                out << " | { outputs |{" << l.layer_details().get_num_outputs() << "}}";
+                end_node();
+                update(i);
+            }
+
             template <typename U, typename E>
             void operator()(size_t i, const add_layer<dropout_, U, E>&)
             {
@@ -840,6 +849,16 @@ namespace dlib
                 out << tag_to_layer.at(t) << " -> " << i << '\n';
                 update(i);
             }
+
+            template <template <typename> class TAG, typename U, typename E>
+            void operator()(size_t i, const add_layer<multm_prev_<TAG>, U, E>&)
+            {
+                start_node(i, "multm");
+                end_node();
+                const auto t = tag_id<TAG>::id;
+                out << tag_to_layer.at(t) << " -> " << i << '\n';
+                update(i);
+            }            
 
             template <template <typename> class TAG, typename U, typename E>
             void operator()(size_t i, const add_layer<resize_prev_to_tagged_<TAG>, U, E>&)
@@ -962,8 +981,8 @@ namespace dlib
                 update(i);
             }
 
-            template <typename U, typename E>
-            void operator()(size_t i, const add_layer<softmax_, U, E>&)
+            template <operation_mode sm, typename U, typename E>
+            void operator()(size_t i, const add_layer<softmax_<sm>, U, E>&)
             {
                 start_node(i, "softmax");
                 end_node();
@@ -1021,10 +1040,42 @@ namespace dlib
                 update(i);
             }
 
+            template <long k, long nr, long nc, typename U, typename E>
+            void operator()(size_t i, const add_layer<reshape_to_<k, nr, nc>, U, E>&)
+            {
+                start_node(i, "reshape_to");
+                if (k == -1) out << " | {k|{unchanged}}";
+                else out << " | {k|{" << k << "}}";
+                if (nr == -1) out << " | {nr|{unchanged}}";
+                else out << " | {nr|{" << nr << "}}";
+                if (nc == -1) out << " | {nc|{unchanged}}";
+                else out << " | {nc|{" << nc << "}}";
+                end_node();
+                update(i);
+            }
+
             template <typename U, typename E>
             void operator()(size_t i, const add_layer<transpose_, U, E>&)
             {
                 start_node(i, "transpose");
+                end_node();
+                update(i);
+            }
+
+            template <unsigned long ne, unsigned long ed, typename U, typename E>
+            void operator()(size_t i, const add_layer<embeddings_<ne, ed>, U, E>& l)
+            {
+                start_node(i, "embeddings");
+                out << " | {num_embeddings|{" << l.layer_details().get_num_embeddings() << "}}";
+                out << " | {embedding_dim|{" << l.layer_details().get_embedding_dim() << "}}";
+                end_node();
+                update(i);
+            }            
+
+            template <typename U, typename E>
+            void operator()(size_t i, const add_layer<positional_encodings_, U, E>&)
+            {
+                start_node(i, "positional_encodings");
                 end_node();
                 update(i);
             }
@@ -1043,8 +1094,8 @@ namespace dlib
                 out << "}}";
                 end_node();
                 update(i);
-            }         
-
+            }
+            
             template <typename T, typename U, typename E>
             void operator()(size_t i, const add_layer<T, U, E>&)
             {

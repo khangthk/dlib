@@ -626,6 +626,7 @@ namespace dlib
     USE_DEFAULT_INT_SERIALIZATION_FOR(unsigned long)
     USE_DEFAULT_INT_SERIALIZATION_FOR(uint64)
     USE_DEFAULT_INT_SERIALIZATION_FOR(int64)
+    USE_DEFAULT_INT_SERIALIZATION_FOR(char32_t)
 
     USE_DEFAULT_BYTE_SERIALIZATION_FOR(char)
     USE_DEFAULT_BYTE_SERIALIZATION_FOR(signed char)
@@ -2570,7 +2571,14 @@ namespace dlib
         // read the size
         in.read((char*)&size, sizeof(size));
         bo.little_to_host(size);
-        if (!in || size == 0)
+        // Empty protos will just be empty.
+        if (size == 0) 
+        {
+            item.Clear();
+            return;
+        }
+
+        if (!in)
             throw dlib::serialization_error("Error while deserializing a Google Protocol Buffer object.");
 
         // read the bytes into temp

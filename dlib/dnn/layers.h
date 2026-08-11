@@ -1,4 +1,4 @@
-// Copyright (C) 2015  Davis E. King (davis@dlib.net)
+﻿// Copyright (C) 2015  Davis E. King (davis@dlib.net)
 // License: Boost Software License   See LICENSE.txt for the full license.
 #ifndef DLIB_DNn_LAYERS_H_
 #define DLIB_DNn_LAYERS_H_
@@ -13,6 +13,7 @@
 #include "../cuda/tensor_tools.h"
 #include "../vectorstream.h"
 #include "utilities.h"
+#include "../cuda/operation_mode.h"
 #include <sstream>
 
 
@@ -974,6 +975,186 @@ namespace dlib
         >
     using resize_to = add_layer<resize_to_<NR,NC>, SUBNET>;
     
+// ----------------------------------------------------------------------------------------
+
+    template <long k_ = -1, long nr_ = -1, long nc_ = -1>
+    class reshape_to_
+    {
+    public:
+        explicit reshape_to_() :
+            output_k(k_),
+            output_nr(nr_),
+            output_nc(nc_)
+        {
+            static_assert(k_ == -1 || k_ > 0, "Output k must be positive or -1");
+            static_assert(nr_ == -1 || nr_ > 0, "Output nr must be positive or -1");
+            static_assert(nc_ == -1 || nc_ > 0, "Output nc must be positive or -1");
+
+            input_k = input_nr = input_nc = 0;
+            needs_rescale = false;
+        }
+
+        // Getters for dimensions
+        long get_output_k() const { return output_k; }
+        long get_output_nr() const { return output_nr; }
+        long get_output_nc() const { return output_nc; }
+
+        // Setters for dimensions
+        void set_output_k(long k) {
+            DLIB_CASSERT(k == -1 || k > 0, "Output k must be positive or -1 to keep original dimension");
+            output_k = k;
+        }
+        void set_output_nr(long nr) {
+            DLIB_CASSERT(nr == -1 || nr > 0, "output nr must be positive or -1 to keep original dimension");
+            output_nr = nr;
+        }
+        void set_output_nc(long nc) {
+            DLIB_CASSERT(nc == -1 || nc > 0, "output nc must be positive or -1 to keep original dimension");
+            output_nc = nc;
+        }
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub)
+        {
+            const auto& input = sub.get_output();
+            input_k = input.k();
+            input_nr = input.nr();
+            input_nc = input.nc();
+
+            // Calculate output dimensions using input dims where target is -1
+            if (k_ == -1) output_k = input_k;
+            if (nr_ == -1) output_nr = input_nr;
+            if (nc_ == -1) output_nc = input_nc;
+
+            // Check if this is well a pure reshape
+            long input_elements = input_k * input_nr * input_nc;
+            long output_elements = output_k * output_nr * output_nc;
+            if (input_elements != output_elements && input_k == output_k) needs_rescale = true;
+            DLIB_CASSERT(input_elements == output_elements || needs_rescale,
+                "Cannot reshape tensor of " << input_elements <<
+                " elements into shape with " << output_elements << " elements. " <<
+                "For spatial rescaling, the channel dimension (k) must remain constant.");
+        }
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            // Set the output size (always preserving batch dimension)
+            const tensor& input = sub.get_output();
+            output.set_size(input.num_samples(), output_k, output_nr, output_nc);
+
+            if (!needs_rescale)
+            {
+                // Create an alias of the input tensor with the output shape
+                alias_tensor input_alias(output.num_samples(), output_k, output_nr, output_nc);
+                // Get a view of the input tensor with the new shape
+                auto input_reshaped = input_alias(const_cast<tensor&>(input), 0);
+                // Copy the view to the output tensor
+                tt::copy_tensor(false, output, 0, input_reshaped, 0, input_reshaped.k());
+            }
+            else
+            {
+                // Only spatial dimensions need to be resized
+                tt::resize_bilinear(output, input);
+            }
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            auto& grad = sub.get_gradient_input();
+
+            if (!needs_rescale) {
+                // Create an alias of the gradient tensor with the original input shape
+                alias_tensor grad_alias(grad.num_samples(), grad.k(), grad.nr(), grad.nc());
+                // Get a view of the input gradient with the required shape
+                auto grad_reshaped = grad_alias(const_cast<tensor&>(gradient_input), 0);
+                // Copy the view to the output gradient
+                tt::copy_tensor(true, grad, 0, grad_reshaped, 0, grad_reshaped.k());
+            }
+            else
+            {
+                // Only spatial dimensions were resized
+                tt::resize_bilinear_gradient(grad, gradient_input);
+            }
+        }
+
+        // Mapping functions for coordinate transformations
+        inline dpoint map_input_to_output(const dpoint& p) const {
+            double scale_x = output_nc / static_cast<double>(input_nc);
+            double scale_y = output_nr / static_cast<double>(input_nr);
+            return dpoint(p.x() * scale_x, p.y() * scale_y);
+        }
+        inline dpoint map_output_to_input(const dpoint& p) const {
+            double scale_x = input_nc / static_cast<double>(output_nc);
+            double scale_y = input_nr / static_cast<double>(output_nr);
+            return dpoint(p.x() * scale_x, p.y() * scale_y);
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const reshape_to_& item, std::ostream& out)
+        {
+            serialize("reshape_to_", out);
+            serialize(item.input_k, out);
+            serialize(item.input_nr, out);
+            serialize(item.input_nc, out);
+            serialize(item.output_k, out);
+            serialize(item.output_nr, out);
+            serialize(item.output_nc, out);
+            serialize(item.needs_rescale, out);
+        }
+
+        friend void deserialize(reshape_to_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "reshape_to_")
+                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::reshape_to_.");
+            deserialize(item.input_k, in);
+            deserialize(item.input_nr, in);
+            deserialize(item.input_nc, in);
+            deserialize(item.output_k, in);
+            deserialize(item.output_nr, in);
+            deserialize(item.output_nc, in);
+            deserialize(item.needs_rescale, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const reshape_to_& item)
+        {
+            out << "reshape_to (";
+            out << "k=" << std::to_string(item.output_k);
+            out << ", nr=" << std::to_string(item.output_nr);
+            out << ", nc=" << std::to_string(item.output_nc);
+            out << ", mode=" << (item.needs_rescale ? "spatial_rescale" : "pure_reshape");
+            out << ")";
+            return out;
+        }
+
+        friend void to_xml(const reshape_to_& item, std::ostream& out)
+        {
+            out << "<reshape_to"
+                << " k='" << item.output_k << "'"
+                << " nr='" << item.output_nr << "'"
+                << " nc='" << item.output_nc << "'"
+                << " mode='" << (item.needs_rescale ? "spatial_rescale" : "pure_reshape") << "'"
+                << "/>\n";
+        }
+
+    private:        
+        long input_k, input_nr, input_nc;       // Input dimensions        
+		long output_k, output_nr, output_nc;    // Output dimensions        
+        bool needs_rescale;        
+        resizable_tensor params;                // No trainable parameters
+    };
+
+    template <long k, long nr, long nc, typename SUBNET>
+    using reshape_to = add_layer<reshape_to_<k, nr, nc>, SUBNET>;
+
+    template <long k, long nr, long nc, typename SUBNET>
+    using flatten = add_layer<reshape_to_<k * nr * nc, 1, 1>, SUBNET>;
+
 // ----------------------------------------------------------------------------------------
 
     template <
@@ -2143,6 +2324,231 @@ namespace dlib
     using fc_no_bias = add_layer<fc_<num_outputs,FC_NO_BIAS>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
+    
+    enum linear_bias_mode { LINEAR_HAS_BIAS = 0, LINEAR_NO_BIAS = 1 };
+
+    template <
+        unsigned long num_outputs_,
+        linear_bias_mode bias_mode_ = LINEAR_HAS_BIAS
+    >
+    class linear_
+    {
+        static_assert(num_outputs_ > 0, "The number of outputs from a linear_ layer must be > 0");
+
+    public:
+        explicit linear_() :
+            num_outputs(num_outputs_),
+            num_inputs(0),                        
+            learning_rate_multiplier(1),
+            bias_mode(bias_mode_) {
+        }
+
+        linear_(const linear_& other) :
+            num_outputs(other.num_outputs),
+            num_inputs(other.num_inputs),
+            learning_rate_multiplier(other.learning_rate_multiplier),
+            bias_mode(other.bias_mode),
+            params(other.params),
+            weights(other.weights),
+            biases(other.biases) {
+        }
+
+        linear_& operator=(const linear_& other) {
+            if (this != &other) {
+                num_outputs = other.num_outputs;
+                num_inputs = other.num_inputs;
+                learning_rate_multiplier = other.learning_rate_multiplier;
+                bias_mode = other.bias_mode;
+                params = other.params;
+                weights = other.weights;
+                biases = other.biases;
+            }
+            return *this;
+        }
+
+        double get_learning_rate_multiplier() const { return learning_rate_multiplier; }
+        void set_learning_rate_multiplier(double val) { learning_rate_multiplier = val; }
+        
+        unsigned long get_num_outputs() const { return num_outputs; }
+        void set_num_outputs(long num)
+        {
+            DLIB_CASSERT(num > 0, "The number of outputs must be > 0, but num == " << num);
+            if (num != (long)num_outputs)
+            {
+                DLIB_CASSERT(get_layer_params().size() == 0,
+                    "You can't change the number of filters in linear_ if the parameter tensor has already been allocated.");
+                num_outputs = num;
+            }
+        }
+        unsigned long get_num_inputs() const { return num_inputs; }
+        linear_bias_mode get_bias_mode() const { return bias_mode; }
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub)
+        {
+            num_inputs = sub.get_output().nc();
+            if (bias_mode == LINEAR_HAS_BIAS)
+                params.set_size(num_inputs + 1, num_outputs);
+            else
+                params.set_size(num_inputs, num_outputs);
+
+            dlib::rand rnd(std::rand());
+            randomize_parameters(params, num_inputs + num_outputs, rnd);
+            weights = alias_tensor(num_inputs, num_outputs);
+
+            if (bias_mode == LINEAR_HAS_BIAS) {
+                biases = alias_tensor(1, num_outputs);
+                biases(params, weights.size()) = 0;
+            }
+        }
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            const auto& prev_output = sub.get_output();
+            DLIB_CASSERT((long)num_inputs == prev_output.nc(),
+                "The size of the input tensor to this linear layer doesn't match the size the linear layer was trained with.");            
+            output.set_size(prev_output.num_samples(), prev_output.k(), prev_output.nr(), num_outputs);
+
+            auto o = alias_tensor(output.num_samples() * output.k() * output.nr(), num_outputs)(output, 0);
+            auto so = alias_tensor(prev_output.num_samples() * prev_output.k() * prev_output.nr(), num_inputs)(prev_output, 0);
+
+            auto w = weights(params, 0);
+            tt::gemm(0, (tensor&)o, 1, so, false, w, false);
+
+            if (bias_mode == LINEAR_HAS_BIAS)
+            {
+                auto b = biases(params, weights.size());
+                tt::add(1, (tensor&)o, 1, b);
+            }
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad)
+        {
+            auto gi = alias_tensor(gradient_input.num_samples() * gradient_input.k() * gradient_input.nr(), num_outputs)(gradient_input, 0);
+            if (learning_rate_multiplier != 0)
+            {
+                const auto& prev_output = sub.get_output();
+                auto pw = weights(params_grad, 0);
+                auto so = alias_tensor(prev_output.num_samples() * prev_output.k() * prev_output.nr(), num_inputs)(prev_output, 0);
+                tt::gemm(0, pw, learning_rate_multiplier, so, true, gi, false);
+
+                if (bias_mode == LINEAR_HAS_BIAS)
+                {
+                    auto pb = biases(params_grad, weights.size());
+                    tt::assign_bias_gradient(pb, gi);
+                }
+            }
+            
+            //prev_gradient is not const, so that sgi isn't const
+            //since sgi is used as a destination for tt::gemm
+            auto& prev_gradient = sub.get_gradient_input();
+            alias_tensor_instance sgi = alias_tensor(prev_gradient.num_samples() * prev_gradient.k() * prev_gradient.nr(), num_inputs)(prev_gradient, 0);
+            auto w = weights(params, 0);
+            tt::gemm(1, sgi, 1, gi, false, w, true);
+        }
+
+        alias_tensor_instance get_weights() { return weights(params, 0); }
+        alias_tensor_const_instance get_weights() const { return weights(params, 0); }
+        alias_tensor_instance get_biases()
+        {
+            static_assert(bias_mode == LINEAR_HAS_BIAS, "This linear_ layer doesn't have a bias vector "
+                "to be retrieved, as per template parameter 'bias_mode'.");
+            return biases(params, weights.size());
+        }
+        alias_tensor_const_instance get_biases() const
+        {
+            static_assert(bias_mode == LINEAR_HAS_BIAS, "This linear_ layer doesn't have a bias vector "
+                "to be retrieved, as per template parameter 'bias_mode'.");
+            return biases(params, weights.size());
+        }
+
+        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
+        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const linear_& item, std::ostream& out)
+        {
+            serialize("linear_", out);
+            serialize(item.num_outputs, out);
+            serialize(item.num_inputs, out);
+            serialize(item.params, out);
+            serialize(item.weights, out);
+            serialize(item.biases, out);
+            serialize((int)item.bias_mode, out);
+            serialize(item.learning_rate_multiplier, out);
+        }
+
+        friend void deserialize(linear_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version == "linear_")
+            {
+                deserialize(item.num_outputs, in);
+                deserialize(item.num_inputs, in);
+                deserialize(item.params, in);
+                deserialize(item.weights, in);
+                deserialize(item.biases, in);
+                int bmode;
+                deserialize(bmode, in);
+                item.bias_mode = static_cast<linear_bias_mode>(bmode);
+                if (bias_mode_ != item.bias_mode) throw serialization_error("Wrong bias_mode found while deserializing dlib::linear_");
+                deserialize(item.learning_rate_multiplier, in);
+            }
+            else
+            {
+                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::linear_.");
+            }
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const linear_& item)
+        {
+            out << "linear\t (num_outputs=" << item.num_outputs;
+            if (item.bias_mode == LINEAR_HAS_BIAS)
+                out << ", bias=true";
+            else
+                out << ", bias=false";
+            out << ")";
+            out << " learning_rate_mult=" << item.learning_rate_multiplier;
+            return out;
+        }
+
+        friend void to_xml(const linear_& item, std::ostream& out)
+        {
+            out << "<linear"
+                << " num_outputs='" << item.num_outputs << "'"
+                << " bias='" << ((item.bias_mode == LINEAR_HAS_BIAS) ? "true" : "false") << "'"
+                << " learning_rate_mult='" << item.learning_rate_multiplier << "'>\n";
+            out << mat(item.params);
+            out << "</linear>\n";
+        }
+
+    private:
+        unsigned long num_outputs;
+        unsigned long num_inputs;        
+        double learning_rate_multiplier;
+        linear_bias_mode bias_mode;
+        resizable_tensor params;
+        alias_tensor weights, biases;
+    };
+
+    template <
+        unsigned long num_outputs,
+        typename SUBNET
+    >
+    using linear = add_layer<linear_<num_outputs>, SUBNET>;
+
+    template <
+        unsigned long num_outputs,
+        typename SUBNET
+    >
+    using linear_no_bias = add_layer<linear_<num_outputs, LINEAR_NO_BIAS>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
 
     class dropout_
     {
@@ -2788,6 +3194,100 @@ namespace dlib
     using mult_prev8_  = mult_prev_<tag8>;
     using mult_prev9_  = mult_prev_<tag9>;
     using mult_prev10_ = mult_prev_<tag10>;
+
+// ----------------------------------------------------------------------------------------
+
+    template <
+        template<typename> class tag
+        >
+    class multm_prev_
+    {
+    public:
+        const static unsigned long id = tag_id<tag>::id;
+
+        multm_prev_() {}
+        template <typename SUBNET> void setup(const SUBNET& /*sub*/) {}
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            auto& t1 = sub.get_output();
+            auto& t2 = layer<tag>(sub).get_output();
+            output.set_size(t1.num_samples(), t1.k(), t1.nr(), t2.nc());
+
+            tt::gemm(0, output, 1, t1, false, t2, false, operation_mode::PLANE_WISE);
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            auto& t1 = sub.get_output();
+            auto& t2 = layer<tag>(sub).get_output();
+            auto& prev = sub.get_gradient_input();
+            auto& prev_tag = layer<tag>(sub).get_gradient_input();            
+
+            tt::gemm(1, prev, 1, gradient_input, false, t2, true, operation_mode::PLANE_WISE);
+            tt::gemm(1, prev_tag, 1, t1, true, gradient_input, false, operation_mode::PLANE_WISE);
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
+        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+
+        friend void serialize(const multm_prev_& /*item*/, std::ostream& out)
+        {
+            serialize("multm_prev_", out);
+        }
+        friend void deserialize(multm_prev_& /*item*/, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "multm_prev_")
+                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::multm_prev_.");
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const multm_prev_& /*item*/)
+        {
+            out << "multm_prev" << id;
+            return out;
+        }
+        friend void to_xml(const multm_prev_& /*item*/, std::ostream& out)
+        {
+            out << "<multm_prev tag='" << id << "'/>\n";
+        }
+
+    private:
+        resizable_tensor params; // unused
+    };
+
+    template <
+        template<typename> class tag,
+        typename SUBNET
+        >
+    using multm_prev = add_layer<multm_prev_<tag>, SUBNET>;
+
+    template <typename SUBNET> using multm_prev1 = multm_prev<tag1, SUBNET>;
+    template <typename SUBNET> using multm_prev2 = multm_prev<tag2, SUBNET>;
+    template <typename SUBNET> using multm_prev3 = multm_prev<tag3, SUBNET>;
+    template <typename SUBNET> using multm_prev4 = multm_prev<tag4, SUBNET>;
+    template <typename SUBNET> using multm_prev5 = multm_prev<tag5, SUBNET>;
+    template <typename SUBNET> using multm_prev6 = multm_prev<tag6, SUBNET>;
+    template <typename SUBNET> using multm_prev7 = multm_prev<tag7, SUBNET>;
+    template <typename SUBNET> using multm_prev8 = multm_prev<tag8, SUBNET>;
+    template <typename SUBNET> using multm_prev9 = multm_prev<tag9, SUBNET>;
+    template <typename SUBNET> using multm_prev10 = multm_prev<tag10, SUBNET>;
+    using multm_prev1_ = multm_prev_<tag1>;
+    using multm_prev2_ = multm_prev_<tag2>;
+    using multm_prev3_ = multm_prev_<tag3>;
+    using multm_prev4_ = multm_prev_<tag4>;
+    using multm_prev5_ = multm_prev_<tag5>;
+    using multm_prev6_ = multm_prev_<tag6>;
+    using multm_prev7_ = multm_prev_<tag7>;
+    using multm_prev8_ = multm_prev_<tag8>;
+    using multm_prev9_ = multm_prev_<tag9>;
+    using multm_prev10_ = multm_prev_<tag10>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -3985,31 +4485,28 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    template <operation_mode s_mode_>
     class softmax_
     {
     public:
-        softmax_() 
-        {
-        }
+        softmax_() {}
 
         template <typename SUBNET>
-        void setup (const SUBNET& /*sub*/)
-        {
-        }
+        void setup(const SUBNET& /*sub*/) {}
 
         void forward_inplace(const tensor& input, tensor& output)
         {
-            tt::softmax(output, input);
-        } 
+            tt::softmax(output, input, s_mode_);
+        }
 
         void backward_inplace(
             const tensor& computed_output,
-            const tensor& gradient_input, 
-            tensor& data_grad, 
-            tensor& 
+            const tensor& gradient_input,
+            tensor& data_grad,
+            tensor& /*params_grad*/
         )
         {
-            tt::softmax_gradient(data_grad, computed_output, gradient_input);
+            tt::softmax_gradient(data_grad, computed_output, gradient_input, s_mode_);
         }
 
         const tensor& get_layer_params() const { return params; }
@@ -4025,26 +4522,31 @@ namespace dlib
             std::string version;
             deserialize(version, in);
             if (version != "softmax_")
-                throw serialization_error("Unexpected version '"+version+"' found while deserializing dlib::softmax_.");
+                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::softmax_.");
         }
 
         friend std::ostream& operator<<(std::ostream& out, const softmax_& /*item*/)
         {
-            out << "softmax";
+            out << "softmax (mode=" << (s_mode_ == operation_mode::CHANNEL_WISE
+                ? "channel_wise" : "plane_wise") << ")";
             return out;
         }
 
         friend void to_xml(const softmax_& /*item*/, std::ostream& out)
         {
-            out << "<softmax/>\n";
+            out << "<softmax mode='" << (s_mode_ == operation_mode::CHANNEL_WISE
+                ? "channel_wise" : "plane_wise") << "'/>\n";
         }
 
     private:
-        resizable_tensor params;
+        resizable_tensor params; // unused
     };
 
     template <typename SUBNET>
-    using softmax = add_layer<softmax_, SUBNET>;
+    using softmax = add_layer<softmax_<operation_mode::CHANNEL_WISE>, SUBNET>;
+
+    template <typename SUBNET>
+    using softmaxm = add_layer<softmax_<operation_mode::PLANE_WISE>, SUBNET>;
 
 // ----------------------------------------------------------------------------------------
 
@@ -4536,6 +5038,131 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    template <
+        long _offset_k,
+        long _offset_nr,
+        long _offset_nc,
+        long _k,
+        long _nr,
+        long _nc
+        >
+    class slice_
+    {
+        static_assert(_offset_k >= 0, "The channel offset must be >= 0.");
+        static_assert(_offset_nr >= 0, "The row offset must be >= 0.");
+        static_assert(_offset_nc >= 0, "The column offset must be >= 0.");
+        static_assert(_k > 0,  "The number of channels must be > 0.");
+        static_assert(_nr > 0, "The number of rows must be > 0.");
+        static_assert(_nc > 0, "The number of columns must be > 0.");
+    public:
+        slice_(
+        )  
+        {
+        }
+
+        template <typename SUBNET>
+        void setup (const SUBNET& sub)
+        {
+            DLIB_CASSERT((long)sub.get_output().size() >= sub.get_output().num_samples()*(_offset_k+_offset_nr+_offset_nc+_k*_nr*_nc), 
+                "The tensor we are trying to slice from the input tensor is too big to fit into the input tensor.");
+        }
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            output.set_size(sub.get_output().num_samples(), _k, _nr, _nc);
+            tt::copy_tensor(false, output, 0, 0, 0, sub.get_output(), _offset_k, _offset_nr, _offset_nc, _k, _nr, _nc);
+        } 
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            tt::copy_tensor(true, sub.get_gradient_input(), _offset_k, _offset_nr, _offset_nc, gradient_input, 0, 0, 0, _k, _nr, _nc);
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        friend void serialize(const slice_& /*item*/, std::ostream& out)
+        {
+            serialize("slice_", out);
+            serialize(_offset_k, out);
+            serialize(_offset_nr, out);
+            serialize(_offset_nc, out);
+            serialize(_k, out);
+            serialize(_nr, out);
+            serialize(_nc, out);
+        }
+
+        friend void deserialize(slice_& /*item*/, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "slice_")
+                throw serialization_error("Unexpected version '"+version+"' found while deserializing dlib::slice_.");
+
+            long offset_k;
+            long offset_nr;
+            long offset_nc;
+            long k;
+            long nr;
+            long nc;
+            deserialize(offset_k, in);
+            deserialize(offset_nr, in);
+            deserialize(offset_nc, in);
+            deserialize(k, in);
+            deserialize(nr, in);
+            deserialize(nc, in);
+
+            if (offset_k != _offset_k) throw serialization_error("Wrong offset_k found while deserializing dlib::slice_");
+            if (offset_nr != _offset_nr) throw serialization_error("Wrong offset_nr found while deserializing dlib::slice_");
+            if (offset_nc != _offset_nc) throw serialization_error("Wrong offset_nc found while deserializing dlib::slice_");
+            if (k != _k)   throw serialization_error("Wrong k found while deserializing dlib::slice_");
+            if (nr != _nr) throw serialization_error("Wrong nr found while deserializing dlib::slice_");
+            if (nc != _nc) throw serialization_error("Wrong nc found while deserializing dlib::slice_");
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const slice_& /*item*/)
+        {
+            out << "slice\t ("
+                << "offset_k="<<_offset_k
+                << "offset_nr="<<_offset_nr
+                << "offset_nc="<<_offset_nc
+                << ", k="<<_k
+                << ", nr="<<_nr
+                << ", nc="<<_nc
+                << ")";
+            return out;
+        }
+
+        friend void to_xml(const slice_& /*item*/, std::ostream& out)
+        {
+            out << "<slice";
+            out << " offset_k='"<<_offset_k<<"'";
+            out << " offset_nr='"<<_offset_nr<<"'";
+            out << " offset_nr='"<<_offset_nc<<"'";
+            out << " k='"<<_k<<"'";
+            out << " nr='"<<_nr<<"'";
+            out << " nc='"<<_nc<<"'";
+            out << "/>\n";
+        }
+    private:
+        resizable_tensor params; // unused
+    };
+
+    template <
+        long offset_k,
+        long offset_nr,
+        long offset_nc,
+        long k,
+        long nr,
+        long nc,
+        typename SUBNET
+        >
+    using slice = add_layer<slice_<offset_k,offset_nr,offset_nc,k,nr,nc>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
     template <long long row_stride = 2, long long col_stride = 2>
     class reorg_
     {
@@ -4640,7 +5267,7 @@ namespace dlib
     class transpose_ {
     public:
         transpose_() {}
-        template <typename SUBNET> void setup(const SUBNET& /* sub */) {}
+        template <typename SUBNET> void setup(const SUBNET& /*sub*/) {}
 
         template <typename SUBNET> void forward(const SUBNET& sub, resizable_tensor& output) {
             auto& prev = sub.get_output();
@@ -4672,21 +5299,21 @@ namespace dlib
         const tensor& get_layer_params() const { return params; }
         tensor& get_layer_params() { return params; }
 
-        friend void serialize(const transpose_& /* item */, std::ostream& out) {
+        friend void serialize(const transpose_& /*item*/, std::ostream& out) {
             serialize("transpose_", out);
         }
-        friend void deserialize(transpose_& /* item */, std::istream& in) {
+        friend void deserialize(transpose_& /*item*/, std::istream& in) {
             std::string version;
             deserialize(version, in);
             if (version != "transpose_")
                 throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::transpose_.");
         }
 
-        friend std::ostream& operator<<(std::ostream& out, const transpose_& /* item */) {
+        friend std::ostream& operator<<(std::ostream& out, const transpose_& /*item*/) {
             out << "transpose";
             return out;
         }
-        friend void to_xml(const transpose_& /* item */, std::ostream& out) {
+        friend void to_xml(const transpose_& /*item*/, std::ostream& out) {
             out << "<transpose />\n";
         }
 
@@ -4698,6 +5325,268 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    class positional_encodings_ {
+    public:
+        positional_encodings_(unsigned long sequence_dim_ = 1, unsigned long embedding_dim_ = 1) :
+            sequence_dim(sequence_dim_), embedding_dim(embedding_dim_)
+        {
+        }
+        positional_encodings_(const positional_encodings_& item) : 
+            pe(item.pe), sequence_dim(item.sequence_dim), embedding_dim(item.embedding_dim)
+        {
+        }
+        positional_encodings_& operator= (const positional_encodings_& item) {
+            if (this == &item) return *this;
+            pe = item.pe;
+            sequence_dim = item.sequence_dim;
+            embedding_dim = item.embedding_dim;
+            return *this;
+        }
+        
+        template <typename SUBNET>
+        void setup(const SUBNET& sub)
+        {
+            auto& prev = sub.get_output();
+
+            sequence_dim = prev.nr();
+            embedding_dim = prev.nc();
+            const unsigned long ns = prev.num_samples();
+            const unsigned long nk = prev.k();
+            const float n = 10000.0f;
+
+            pe.set_size(ns, nk, sequence_dim, embedding_dim);              
+            for (unsigned long s = 0; s < ns; ++s)
+            {
+                for (unsigned long k = 0; k < nk; ++k)
+                {
+                    for (unsigned long r = 0; r < sequence_dim; ++r)
+                    {
+                        for (unsigned long c = 0; c < embedding_dim; ++c)
+                        {
+                            float theta = static_cast<float>(r) / std::pow(n, static_cast<float>(c) / embedding_dim);
+                            if (c % 2 == 0) pe.host()[tensor_index(pe, s, k, r, c)] = std::sin(theta);
+                            else pe.host()[tensor_index(pe, s, k, r, c)] = std::cos(theta);
+                        }
+                    }
+                }
+            }
+        }
+        
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {            
+            const auto& prev_output = sub.get_output();            
+            if (!have_same_dimensions(pe, prev_output)) setup(sub);
+            
+            output.set_size(prev_output.num_samples(), prev_output.k(), sequence_dim, embedding_dim);
+            tt::add(output, prev_output, pe);
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            auto& prev_grad = sub.get_gradient_input();
+            tt::add(prev_grad, prev_grad, gradient_input);
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        const tensor& get_positional_encodings() const { return pe; }
+        tensor& get_positional_encodings() { return pe; }
+
+        friend void serialize(const positional_encodings_& /*item*/, std::ostream& out)
+        {
+            serialize("positional_encodings_", out);
+        }
+        friend void deserialize(positional_encodings_& /*item*/, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "positional_encodings_")
+                throw serialization_error("Unexpected version '" + version + "' found while deserializing dlib::positional_encodings_.");
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const positional_encodings_& /*item*/)
+        {
+            out << "positional_encodings";
+            return out;
+        }
+        friend void to_xml(const positional_encodings_& /*item*/, std::ostream& out)
+        {
+            out << "<positional_encodings />\n";
+        }
+
+    private:
+        resizable_tensor params; // unused
+        resizable_tensor pe;
+        unsigned long sequence_dim, embedding_dim;
+    };
+
+    template <typename SUBNET>
+    using positional_encodings = add_layer<positional_encodings_, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+
+    template<
+        unsigned long num_embeddings_,
+        unsigned long embedding_dim_
+        >
+    class embeddings_
+    {
+        static_assert(num_embeddings_ > 0, "The size of the embedding dictionary must be > 0");
+        static_assert(embedding_dim_ > 0, "The size of each embedding vector must be > 0");
+
+    public:
+        embeddings_() : num_embeddings(num_embeddings_),
+            embedding_dim(embedding_dim_),
+            learning_rate_multiplier(1.0f),
+            scale_by_freq(true)
+        {
+        }
+
+        double get_learning_rate_multiplier() const { return learning_rate_multiplier; }
+        void set_learning_rate_multiplier(double val) { learning_rate_multiplier = val; }
+
+        void set_scale_by_freq(bool val) { scale_by_freq = val; }
+        bool get_scale_by_freq() const { return scale_by_freq; }
+
+        unsigned long get_num_embeddings() const { return num_embeddings; }
+        void set_num_embeddings(unsigned long num)
+        {
+            DLIB_CASSERT(num > 0);
+            if (num != num_embeddings)
+            {
+                DLIB_CASSERT(get_embeddings().size() == 0,
+                    "It is not possible to change the size of the embedding dictionary if the parameter has already been assigned.");                
+            }
+        }
+
+        unsigned long get_embedding_dim() const { return embedding_dim; }
+        void set_embedding_dim(unsigned long dim)
+        {
+            DLIB_CASSERT(dim > 0);
+            if (dim != embedding_dim)
+            {
+                DLIB_CASSERT(get_embeddings().size() == 0,
+                    "It is not possible to change the size of the embedding dictionary if the parameter has already been assigned.");
+            }
+        }
+
+        template <typename SUBNET>
+        void setup(const SUBNET& /*sub*/)
+        {
+            embs.set_size(num_embeddings, embedding_dim);
+            tt::tensor_rand rnd(std::rand());
+            rnd.fill_gaussian(embs);
+        }
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output)
+        {
+            const auto& prev = sub.get_output();
+            output.set_size(prev.num_samples(), prev.k(), prev.nr(), embedding_dim);
+
+            tt::embeddings(output, prev, embs);
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& /*params_grad*/)
+        {
+            // Because this class is expected to be directly after an <input> layer,
+            // it's not necessary to propagate the gradient.
+            // Additionally, this layer is treated as constant during backpropagation,
+            // so it technically doesn't contribute to the gradient computation.
+            if (learning_rate_multiplier != 0)
+            {
+                auto& prev_src = sub.get_output();
+                
+                calc_token_freqs(prev_src, gradient_input);
+                tt::embeddings_gradient(prev_src, gradient_input, embs, freqs, learning_rate_multiplier, scale_by_freq);
+            }
+        }
+
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+
+        const tensor& get_embeddings() const { return embs; }
+        tensor& get_embeddings() { return embs; }
+
+        friend void serialize(const embeddings_& item, std::ostream& out)
+        {
+            serialize("embeddings_", out);
+            serialize(item.embs, out);
+            serialize(item.num_embeddings, out);
+            serialize(item.embedding_dim, out);
+            serialize(item.learning_rate_multiplier, out);
+            serialize(item.scale_by_freq, out);
+        }
+        friend void deserialize(embeddings_& item, std::istream& in)
+        {
+            std::string version;
+            deserialize(version, in);
+            if (version != "embeddings_")
+                throw serialization_error("Unexpected version found while deserializing dlib::embeddings_.");
+            deserialize(item.embs, in);
+            deserialize(item.num_embeddings, in);
+            deserialize(item.embedding_dim, in);
+            deserialize(item.learning_rate_multiplier, in);
+            deserialize(item.scale_by_freq, in);
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const embeddings_& item)
+        {
+            out << "embeddings (num_embeddings=" << item.num_embeddings
+                << ", embedding_dim=" << item.embedding_dim
+                << ") learning_rate_mult=" << item.learning_rate_multiplier;
+            return out;
+        }
+        friend void to_xml(const embeddings_& item, std::ostream& out)
+        {
+            out << "<embeddings num_embeddings='" << item.num_embeddings
+                << "' embedding_dim='" << item.embedding_dim
+                << "' learning_rate_mult='"
+                << item.learning_rate_multiplier << "'>\n";
+            out << mat(item.embs);
+            out << "</embeddings>\n";
+        }
+
+    private:
+        void calc_token_freqs(const tensor& prev, const tensor& input) {
+            if (freqs.size() == 0) freqs.set_size(num_embeddings, 1, 1, 1);
+            freqs = 0;
+
+            const float* prev_data = prev.host();
+            float* freqs_data = freqs.host();
+            for (long s = 0; s < input.num_samples(); ++s)
+            {
+                for (long k = 0; k < input.k(); ++k)
+                {
+                    for (long r = 0; r < input.nr(); ++r)
+                    {
+                        const unsigned long token_idx = static_cast<unsigned long>(prev_data[tensor_index(prev, s, k, r, 0)]);
+                        if (token_idx < num_embeddings) freqs_data[tensor_index(freqs, token_idx, 0, 0, 0)]++;
+                    }
+                }
+            }
+        }
+
+        resizable_tensor params; // unused
+        resizable_tensor embs, freqs;
+        unsigned long num_embeddings, embedding_dim;
+        double learning_rate_multiplier;
+        bool scale_by_freq;
+    };
+
+    template <
+        unsigned long nb_embeddings,
+        unsigned long embedding_length,
+        typename SUBNET
+        >
+    using embeddings = add_layer<embeddings_<nb_embeddings, embedding_length>, SUBNET>;
+
+// ----------------------------------------------------------------------------------------
+  
     struct neg_infinity_tag {};
     struct zero_tag {};
 
@@ -4824,8 +5713,376 @@ namespace dlib
 
 // ----------------------------------------------------------------------------------------
 
+    template <long max_steps = 8>
+    class adaptive_computation_time_ {
+    public:
+        explicit adaptive_computation_time_() :
+            max_steps_(max_steps),
+            halt_threshold_(0.99f),     // theta in Graves' notation
+            ponder_penalty_(0.01f),     // lambda (ponder cost weight)
+            enable_depth_scaling_(false),
+            batch_size_(0),
+            seq_len_(0),
+            d_model_(0),
+            num_channels_(0),
+            feature_dim_(0),
+            ponder_cost_(0),
+            avg_steps_(0)
+        {
+        }
+
+        adaptive_computation_time_(const adaptive_computation_time_& item) :
+            max_steps_(item.max_steps_),
+            halt_threshold_(item.halt_threshold_),
+            ponder_penalty_(item.ponder_penalty_),
+            enable_depth_scaling_(item.enable_depth_scaling_),
+            batch_size_(item.batch_size_),
+            seq_len_(item.seq_len_),
+            d_model_(item.d_model_),
+            num_channels_(item.num_channels_),
+            feature_dim_(item.feature_dim_),
+            ponder_cost_(item.ponder_cost_),
+            avg_steps_(item.avg_steps_),
+            params(item.params),
+            halting_probs_(item.halting_probs_),
+            cumulative_halting_(item.cumulative_halting_),
+            remainders_(item.remainders_),
+            n_steps_(item.n_steps_),
+            logits_(item.logits_),
+            grad_logits_(item.grad_logits_),
+            input_cache_(item.input_cache_),
+            true_effective_weights_(item.true_effective_weights_)
+        {
+        }
+
+        adaptive_computation_time_& operator=(const adaptive_computation_time_& item)
+        {
+            if (this == &item)
+                return *this;
+
+            max_steps_ = item.max_steps_;
+            halt_threshold_ = item.halt_threshold_;
+            ponder_penalty_ = item.ponder_penalty_;
+            enable_depth_scaling_ = item.enable_depth_scaling_;
+            batch_size_ = item.batch_size_;
+            seq_len_ = item.seq_len_;
+            d_model_ = item.d_model_;
+            num_channels_ = item.num_channels_;
+            feature_dim_ = item.feature_dim_;
+            ponder_cost_ = item.ponder_cost_;
+            avg_steps_ = item.avg_steps_;
+            params = item.params;
+            halting_probs_ = item.halting_probs_;
+            cumulative_halting_ = item.cumulative_halting_;
+            remainders_ = item.remainders_;
+            n_steps_ = item.n_steps_;
+            logits_ = item.logits_;
+            grad_logits_ = item.grad_logits_;
+            input_cache_ = item.input_cache_;
+            true_effective_weights_ = item.true_effective_weights_;
+
+            return *this;
+        }
+
+        template <typename SUBNET>
+        void setup(const SUBNET& sub) {
+            const auto& input = sub.get_output();
+
+            // Store expected dimensions for parameter initialization
+            batch_size_ = input.num_samples();
+            seq_len_ = input.nr();
+            d_model_ = input.nc();
+            num_channels_ = input.k();
+            feature_dim_ = d_model_ * num_channels_;
+
+            // Initialize halting parameters
+            params.set_size(1, 1, feature_dim_ + 1, 1);
+
+            // He initialization for stability
+            dlib::rand rnd(std::rand());
+            const float scale = std::sqrt(2.0f / feature_dim_);
+            float* p = params.host();
+
+            // Initialize weight matrix W_halt
+            for (long i = 0; i < feature_dim_; ++i)
+                p[i] = rnd.get_random_gaussian() * scale;
+
+            // Initialize bias b_halt (typically zero)
+            p[feature_dim_] = 0.0f;
+
+            // Pre-allocate workspace for maximum expected size
+            allocate_workspace();
+        }
+
+        template <typename SUBNET>
+        void forward(const SUBNET& sub, resizable_tensor& output) {
+            const tensor& input = sub.get_output();
+            output.copy_size(input);
+
+            // Ensure workspace is allocated for current batch dimensions
+            const long curr_batch = input.num_samples();
+            if (curr_batch != batch_size_) {
+                batch_size_ = curr_batch;
+                allocate_workspace();
+            }
+
+            // Initialize output for weighted accumulation
+            output = 0;
+
+            // Initialize ACT state vectors
+            const long total_positions = batch_size_ * seq_len_;
+            float* cum_halt_ptr = cumulative_halting_.host();
+            float* remainders_ptr = remainders_.host();
+            float* n_steps_ptr = n_steps_.host();
+
+            for (long i = 0; i < total_positions; ++i) {
+                cum_halt_ptr[i] = 0.0f;      // h_t^n: cumulative halting probability
+                remainders_ptr[i] = 1.0f;    // ρ_t: remaining probability mass  
+                n_steps_ptr[i] = 0.0f;       // N(t): number of computation steps
+            }
+
+            // Cache input for backward pass
+            input_cache_.copy_size(input);
+            tt::copy_tensor(false, input_cache_, 0, input, 0, input.k());
+
+            // Initialize effective weights tracker for gradient computation
+            true_effective_weights_.set_size(total_positions, 1, 1, 1);
+            true_effective_weights_ = 0;
+
+            // Main ACT computation loop
+            for (long step = 0; step < max_steps_; ++step) {
+
+                // Compute halting probabilities: p_t^n = sigmoid(W_halt^T * s_t^n + b_halt)
+                tt::compute_act_halt_probabilities(
+                    halting_probs_, logits_, input, params,
+                    batch_size_, seq_len_, feature_dim_);
+
+                // Update ACT state and accumulate weighted outputs
+                tt::update_act_state(
+                    output, input, halting_probs_,
+                    cumulative_halting_, remainders_, n_steps_,
+                    true_effective_weights_,
+                    batch_size_, seq_len_, d_model_, num_channels_,
+                    halt_threshold_, step
+                );
+
+                // Early termination optimization
+                if (all_positions_halted(cumulative_halting_)) break;
+            }
+
+            // Finalize with remainder contributions
+            tt::finalize_act_output(
+                output, input, remainders_,
+                true_effective_weights_,
+                batch_size_, seq_len_, d_model_, num_channels_);
+
+            // Compute statistics for monitoring and regularization
+            compute_ponder_stats();
+        }
+
+        template <typename SUBNET>
+        void backward(const tensor& gradient_input, SUBNET& sub, tensor& params_grad) {                     
+            tensor& input_grad = sub.get_gradient_input();
+
+            const float* grad_in = gradient_input.host();
+            const float* eff_weights = true_effective_weights_.host();
+            float* grad_out = input_grad.host();
+
+            for (long n = 0; n < batch_size_; ++n) {
+                for (long s = 0; s < seq_len_; ++s) {
+                    const long pos = n * seq_len_ + s;
+                    const float weight = eff_weights[pos];
+
+                    for (long c = 0; c < num_channels_; ++c) {
+                        for (long d = 0; d < d_model_; ++d) {
+                            const long idx = ((n * num_channels_ + c) * seq_len_ + s) * d_model_ + d;
+                            grad_out[idx] += weight * grad_in[idx];
+                        }
+                    }
+                }
+            }
+
+            // Compute parameter gradients from ponder cost regularization
+            params_grad = 0;
+
+            // Optional: Apply depth-dependent gradient scaling
+            if (enable_depth_scaling_) {
+                tt::apply_act_depth_scaling(
+                    input_grad, n_steps_,
+                    batch_size_, seq_len_, d_model_, num_channels_,
+                    static_cast<float>(max_steps_), 0.1f
+                );
+            }
+        }
+
+        // Accessor methods
+        const tensor& get_layer_params() const { return params; }
+        tensor& get_layer_params() { return params; }
+        long get_max_steps() const { return max_steps_; }
+        float get_halt_threshold() const { return halt_threshold_; }
+        float get_ponder_penalty() const { return ponder_penalty_; }
+
+        void set_halt_threshold(float threshold) {
+            if (threshold > 0 && threshold <= 1.0f)
+                halt_threshold_ = threshold;
+        }
+        void set_ponder_penalty(float penalty) {
+            if (penalty >= 0)
+                ponder_penalty_ = penalty;
+        }
+
+        // Statistics for monitoring and regularization
+        float get_ponder_cost() const { return ponder_cost_; }  // R(x)
+        float get_average_steps() const { return avg_steps_; }  // Average N(t)
+
+        // Depth scaling control
+        void enable_depth_scaling() { enable_depth_scaling_ = true; }
+        void disable_depth_scaling() { enable_depth_scaling_ = false; }
+        bool depth_scaling_enabled() const { return enable_depth_scaling_; }
+
+        inline dpoint map_input_to_output(const dpoint& p) const { return p; }
+        inline dpoint map_output_to_input(const dpoint& p) const { return p; }
+
+        // Serialization methods
+        friend void serialize(const adaptive_computation_time_& item, std::ostream& out) {
+            dlib::serialize("act_", out);
+            dlib::serialize(item.max_steps_, out);
+            dlib::serialize(item.halt_threshold_, out);
+            dlib::serialize(item.ponder_penalty_, out);
+            dlib::serialize(item.enable_depth_scaling_, out);
+            dlib::serialize(item.batch_size_, out);
+            dlib::serialize(item.seq_len_, out);
+            dlib::serialize(item.d_model_, out);
+            dlib::serialize(item.num_channels_, out);
+            dlib::serialize(item.feature_dim_, out);
+            dlib::serialize(item.params, out);
+        }
+
+        friend void deserialize(adaptive_computation_time_& item, std::istream& in) {
+            std::string version;
+            dlib::deserialize(version, in);
+            if (version != "act_")
+                throw serialization_error("Unexpected version: " + version);
+            dlib::deserialize(item.max_steps_, in);
+            dlib::deserialize(item.halt_threshold_, in);
+            dlib::deserialize(item.ponder_penalty_, in);
+            dlib::deserialize(item.enable_depth_scaling_, in);
+            dlib::deserialize(item.batch_size_, in);
+            dlib::deserialize(item.seq_len_, in);
+            dlib::deserialize(item.d_model_, in);
+            dlib::deserialize(item.num_channels_, in);
+            dlib::deserialize(item.feature_dim_, in);
+            dlib::deserialize(item.params, in);
+
+            item.allocate_workspace();
+        }
+
+        friend std::ostream& operator<<(std::ostream& out, const adaptive_computation_time_& item) {
+            out << "act (steps=" << item.max_steps_
+                << ", dim=" << item.feature_dim_
+                << ", threshold=" << item.halt_threshold_
+                << ", penalty=" << item.ponder_penalty_ << ")";
+            return out;
+        }
+
+        friend void to_xml(const adaptive_computation_time_& item, std::ostream& out) {
+            out << "<act"
+                << " steps='" << item.max_steps_ << "'"
+                << " dim='" << item.feature_dim_ << "'"
+                << " threshold='" << item.halt_threshold_ << "'"
+                << " penalty='" << item.ponder_penalty_ << "'"
+                << " depth_scaling='" << (item.enable_depth_scaling_ ? "true" : "false") << "'"
+                << ">\n";
+            out << mat(item.params);
+            out << "</act>\n";
+        }
+
+    private:
+        void allocate_workspace() {
+            const long total_positions = batch_size_ * seq_len_;
+
+            // Allocate state tensors for maximum expected size
+            // These track the ACT state for each position (batch, sequence)
+            halting_probs_.set_size(total_positions, 1, 1, 1);      // p_t^n
+            cumulative_halting_.set_size(total_positions, 1, 1, 1); // h_t^n
+            remainders_.set_size(total_positions, 1, 1, 1);         // rho_t
+            n_steps_.set_size(total_positions, 1, 1, 1);            // N(t)
+            logits_.set_size(total_positions, 1, 1, 1);             // logits before sigmoid
+            grad_logits_.set_size(total_positions, 1, 1, 1);        // gradient w.r.t. logits
+            true_effective_weights_.set_size(total_positions, 1, 1, 1);
+
+            // Input cache needs full dimensions for gradient computation
+            input_cache_.set_size(batch_size_, num_channels_, seq_len_, d_model_);
+        }
+
+        bool all_positions_halted(const resizable_tensor& ch) const {
+            const float* cum_halt = ch.host();
+            const long total = batch_size_ * seq_len_;
+
+            for (long i = 0; i < total; ++i) {
+                if (cum_halt[i] < halt_threshold_) return false;
+            }
+            return true;
+        }
+
+        void compute_ponder_stats() {
+            const float* steps = n_steps_.host();
+            const long total = batch_size_ * seq_len_;
+
+            // Compute average number of steps: (1/T) * SUM N(t)
+            float sum_steps = 0;
+            for (long i = 0; i < total; ++i) sum_steps += steps[i];
+            avg_steps_ = sum_steps / total;
+
+            // Normalize ponder cost by maximum possible steps
+            ponder_cost_ = avg_steps_ / max_steps_;
+        }
+
+        // Configuration parameters
+        long max_steps_;                // Maximum computation steps per position
+        float halt_threshold_;          // theta: Halting threshold (typically 0.99)
+        float ponder_penalty_;          // lambda: Ponder cost weight for regularization
+        bool enable_depth_scaling_;     // Enable depth-dependent gradient scaling
+
+        // Dimension tracking
+        long batch_size_;
+        long seq_len_;
+        long d_model_;
+        long num_channels_;
+        long feature_dim_;
+
+        // Learnable parameters
+        resizable_tensor params;
+
+        // Working memory
+        resizable_tensor halting_probs_;        // p_t^n: Halting probabilities
+        resizable_tensor cumulative_halting_;   // h_t^n: Cumulative halting probabilities
+        resizable_tensor remainders_;           // rho_t: Remaining probability mass
+        resizable_tensor n_steps_;              // N(t): Number of steps taken
+        resizable_tensor logits_;               // Raw logits before sigmoid
+        resizable_tensor grad_logits_;          // Gradients w.r.t. logits
+        resizable_tensor input_cache_;          // Cached input for backward pass
+        resizable_tensor true_effective_weights_;
+
+        // Statistics for monitoring
+        float ponder_cost_;      // R(x): Current ponder cost
+        float avg_steps_;        // Average number of computation steps
+    };
+
+    template <long max_steps, typename SUBNET>
+    using adaptive_computation_time = add_layer<adaptive_computation_time_<max_steps>, SUBNET>;
+
+    template <typename SUBNET>
+    using act = add_layer<adaptive_computation_time_<8>, SUBNET>;       // Default 8 steps
+
+    template <typename SUBNET>
+    using act4 = add_layer<adaptive_computation_time_<4>, SUBNET>;      // Fast version
+
+    template <typename SUBNET>
+    using act16 = add_layer<adaptive_computation_time_<16>, SUBNET>;    // Deep version
+
+// ----------------------------------------------------------------------------------------
+
 }
 
 #endif // DLIB_DNn_LAYERS_H_
-
-

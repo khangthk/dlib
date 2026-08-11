@@ -2823,11 +2823,13 @@ namespace dlib
             }
 
             double loss;
-#ifdef DLIB_USE_CUDA
-            cuda_compute(truth, output_tensor, grad, loss);
-#else
-            cpu_compute(truth, output_tensor, grad, loss);
-#endif
+            IF_DLIB_USE_CUDA(
+                cuda_compute(truth, output_tensor, grad, loss);
+            )
+
+            IF_DLIB_NOT_USE_CUDA(
+                cpu_compute(truth, output_tensor, grad, loss);
+            )
             return loss;
         }
 
@@ -2859,9 +2861,8 @@ namespace dlib
 
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_binary_log_per_pixel cuda_compute;
-#else
-        cpu::compute_loss_binary_log_per_pixel cpu_compute;
 #endif
+        cpu::compute_loss_binary_log_per_pixel cpu_compute;
     };
 
     template <typename SUBNET>
@@ -2968,11 +2969,13 @@ namespace dlib
 
 
             double loss;
-#ifdef DLIB_USE_CUDA
-            cuda_compute(truth, output_tensor, grad, loss);
-#else
-            cpu_compute(truth, output_tensor, grad, loss);
-#endif
+            IF_DLIB_USE_CUDA(
+                cuda_compute(truth, output_tensor, grad, loss);
+            )
+
+            IF_DLIB_NOT_USE_CUDA(
+                cpu_compute(truth, output_tensor, grad, loss);
+            )
             return loss;
         }
 
@@ -3004,9 +3007,8 @@ namespace dlib
 
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_multiclass_log_per_pixel cuda_compute;
-#else
-        cpu::compute_loss_multiclass_log_per_pixel cpu_compute;
 #endif
+        cpu::compute_loss_multiclass_log_per_pixel cpu_compute;
     };
 
     template <typename SUBNET>
@@ -3068,11 +3070,13 @@ namespace dlib
             }
 
             double loss;
-#ifdef DLIB_USE_CUDA
-            cuda_compute(truth, output_tensor, grad, loss);
-#else
-            cpu_compute(truth, output_tensor, grad, loss);
-#endif
+            IF_DLIB_USE_CUDA(
+                cuda_compute(truth, output_tensor, grad, loss);
+            )
+
+            IF_DLIB_NOT_USE_CUDA(
+                cpu_compute(truth, output_tensor, grad, loss);
+            )
             return loss;
         }
 
@@ -3104,9 +3108,8 @@ namespace dlib
 
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_multiclass_log_per_pixel_weighted cuda_compute;
-#else
-        cpu::compute_loss_multiclass_log_per_pixel_weighted cpu_compute;
 #endif
+        cpu::compute_loss_multiclass_log_per_pixel_weighted cpu_compute;
 
     };
 
@@ -3319,11 +3322,13 @@ namespace dlib
                 }
             }
             double loss;
-#ifdef DLIB_USE_CUDA
-            cuda_compute(truth, output_tensor, grad, loss);
-#else
-            cpu_compute(truth, output_tensor, grad, loss);
-#endif
+            IF_DLIB_USE_CUDA(
+                cuda_compute(truth, output_tensor, grad, loss);
+            )
+
+            IF_DLIB_NOT_USE_CUDA(
+                cpu_compute(truth, output_tensor, grad, loss);
+            )
             return loss;
         }
 
@@ -3355,9 +3360,8 @@ namespace dlib
 
 #ifdef DLIB_USE_CUDA
         cuda::compute_loss_mean_squared_per_channel_and_pixel cuda_compute;
-#else
-        cpu::compute_loss_mean_squared_per_channel_and_pixel cpu_compute;
 #endif
+        cpu::compute_loss_mean_squared_per_channel_and_pixel cpu_compute;
     };
 
     template <long num_channels, typename SUBNET>
@@ -3827,8 +3831,8 @@ namespace dlib
                         const auto y_idx = tensor_index(output_tensor, n, k + 1, r, c);
                         const auto w_idx = tensor_index(output_tensor, n, k + 2, r, c);
                         const auto h_idx = tensor_index(output_tensor, n, k + 3, r, c);
-                        g[x_idx] = scale_box * put_in_range(-1, 1, (out_data[x_idx] * 2.0 - 0.5 - tx));
-                        g[y_idx] = scale_box * put_in_range(-1, 1, (out_data[y_idx] * 2.0 - 0.5 - ty));
+                        g[x_idx] = scale_box * put_in_range(-1, 1, (out_data[x_idx] * 2.0 - 0.5 - tx)) * 2.0f;
+                        g[y_idx] = scale_box * put_in_range(-1, 1, (out_data[y_idx] * 2.0 - 0.5 - ty)) * 2.0f;
                         g[w_idx] = scale_box * put_in_range(-1, 1, (out_data[w_idx] - tw));
                         g[h_idx] = scale_box * put_in_range(-1, 1, (out_data[h_idx] - th));
 
@@ -3863,7 +3867,7 @@ namespace dlib
                 }
 
                 // The loss is the squared norm of the gradient
-                loss += length_squared(rowm(mat(grad), n));
+                loss += 0.5 * length_squared(rowm(mat(grad), n));
             }
         };
     }

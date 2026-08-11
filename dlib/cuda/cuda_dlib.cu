@@ -1,14 +1,46 @@
-// Copyright (C) 2015  Davis E. King (davis@dlib.net)
+﻿// Copyright (C) 2015  Davis E. King (davis@dlib.net)
 // License: Boost Software License   See LICENSE.txt for the full license.
 
 #include "cuda_utils.h"
 #include "cuda_dlib.h"
 #include "cudnn_dlibapi.h"
 #include <math_constants.h>
+#include <cstdlib>
+#include <cstring>
 
 
 namespace dlib 
 { 
+    namespace
+    {
+        bool cuda_device_available (
+        )
+        {
+            int num_devices;
+            return cudaGetDeviceCount(&num_devices) == cudaSuccess && num_devices > 0;
+        }
+
+        bool cuda_disabled_by_environment (
+        )
+        {
+            const char* var = std::getenv("DLIB_DISABLE_CUDA_USE");
+            return var != nullptr &&
+                std::strcmp(var, "") != 0 &&
+                std::strcmp(var, "0") != 0 &&
+                std::strcmp(var, "false") != 0 &&
+                std::strcmp(var, "False") != 0 &&
+                std::strcmp(var, "FALSE") != 0;
+        }
+
+        bool use_cuda_impl (
+        )
+        {
+            static const bool var = !cuda_disabled_by_environment() && cuda_device_available();
+            return var;
+        }
+
+    }
+
     namespace cuda 
     {
 
@@ -18,6 +50,12 @@ namespace dlib
             int dev
         )
         {
+            if (!use_cuda())
+            {
+                DLIB_CASSERT(dev == 0, "dlib::cuda::set_device(id) called with an invalid device id.");
+                return;
+            }
+
             CHECK_CUDA(cudaSetDevice(dev));
         }
 
@@ -25,7 +63,8 @@ namespace dlib
         )
         {
             int dev = 0;
-            CHECK_CUDA(cudaGetDevice(&dev));
+            if (use_cuda())
+                CHECK_CUDA(cudaGetDevice(&dev));
             return dev;
         }
 
@@ -33,6 +72,12 @@ namespace dlib
             int device
         )
         {
+            if (!use_cuda())
+            {
+                DLIB_CASSERT(device == 0, "dlib::cuda::get_device_name(device) called with an invalid device id.");
+                return "CUDA_DISABLED";
+            }
+
             cudaDeviceProp props;
             CHECK_CUDA(cudaGetDeviceProperties(&props, device));
             return props.name;
@@ -41,12 +86,22 @@ namespace dlib
         void set_current_device_blocking_sync(
         )
         {
-            CHECK_CUDA(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+            if (use_cuda())
+                CHECK_CUDA(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+        }
+
+        bool use_cuda(
+        )
+        {
+            return use_cuda_impl();
         }
 
         int get_num_devices (
         )
         {
+            if (!use_cuda())
+                return 0;
+
             int num_devices;
             CHECK_CUDA(cudaGetDeviceCount(&num_devices));
             return num_devices;
@@ -54,6 +109,9 @@ namespace dlib
 
         bool can_access_peer (int device_id, int peer_device_id)
         {
+            if (!use_cuda())
+                return false;
+
             int can_access;
             CHECK_CUDA(cudaDeviceCanAccessPeer(&can_access, device_id, peer_device_id));
             return can_access != 0;
@@ -65,6 +123,9 @@ namespace dlib
 
         void device_synchronize (int dev) 
         { 
+            if (!use_cuda())
+                return;
+
             raii_set_device set_dev(dev);
             CHECK_CUDA(cudaDeviceSynchronize());
         }
@@ -76,6 +137,9 @@ namespace dlib
             int peer_device_id
         ) : call_disable(false), device_id(device_id), peer_device_id(peer_device_id)
         {
+            if (!use_cuda())
+                return;
+
             raii_set_device set_dev(device_id);
 
             auto err = cudaDeviceEnablePeerAccess(peer_device_id, 0);
@@ -2090,6 +2154,126 @@ namespace dlib
 
     // ----------------------------------------------------------------------------------------
 
+        __global__ void _cuda_embeddings(size_t dsize, size_t dk, size_t dr, size_t dc,
+            float* d, const float* s, const float* e, size_t es
+        )
+        {
+            for (auto i : grid_stride_range(0, dsize))
+            {
+                const auto n = i / (dk * dr * dc);
+                const auto s_idx = i % (dk * dr * dc);
+                const auto k = (s_idx / (dr * dc)) % dk;
+                const auto r = (s_idx / dc) % dr;
+                const auto c = s_idx % dc;
+
+                const unsigned long t_idx = static_cast<unsigned long>(s[(n * dk + k) * dr + r]);
+
+                if (t_idx < es)
+                    d[i] = e[t_idx * dc + c];
+                else
+                    d[i] = 0.0f;
+            }
+        }
+
+        void embeddings(
+            resizable_tensor& dest,
+            const tensor& src,
+            const tensor& embs
+        )
+        {
+            DLIB_CASSERT(
+                src.nr() > 0 &&
+                embs.num_samples() > 0 &&
+                embs.k() > 0 &&
+                embs.nr() == 1 &&
+                embs.nc() == 1,
+                "\nsrc.num_samples(): " << src.num_samples() <<
+                "\nsrc.k(): " << src.k() <<
+                "\nsrc.nr(): " << src.nr() <<
+                "\nsrc.nc(): " << src.nc() <<
+                "\nembs.num_samples(): " << embs.num_samples() <<
+                "\nembs.k(): " << embs.k() <<
+                "\nembs.nr(): " << embs.nr() <<
+                "\nembs.nc(): " << embs.nc()
+            );
+
+            const long dk = dest.k();
+            const long dr = dest.nr();
+            const long dc = dest.nc();
+
+            launch_kernel(_cuda_embeddings, dest.size(), dk, dr, dc,
+                dest.device(), src.device(), embs.device(), embs.num_samples());
+        }
+
+        __global__ void _cuda_embeddings_gradient(size_t ssize, size_t sk, size_t sr, size_t sc,
+            const float* o, const float* gi, float* g, const float* f, float lr, bool sl, size_t es
+        )
+        {
+            for (auto i : grid_stride_range(0, ssize))
+            {
+                const auto n = i / (sk * sr * sc);
+                const auto s_idx = i % (sk * sr * sc);
+                const auto k = (s_idx / (sr * sc)) % sk;
+                const auto r = (s_idx / sc) % sr;
+                const auto c = s_idx % sc;
+
+                const unsigned long t_idx = static_cast<unsigned long>(o[(n * sk + k) * sr + r]);
+                if (t_idx < es)
+                {
+                    const float f_t = f[t_idx];
+                    float f_s = 1.0f;                    
+
+                    if (sl && f_t != 0.0f) f_s = fminf(0.15f, fmaxf(1.0f / f_t, 1.0f));
+                    if (f_t > 1) atomicAdd(&g[t_idx * sc + c], -gi[i] * lr * f_s);
+                    else g[t_idx * sc + c] -= gi[i] * lr * f_s;
+                }
+            }
+        }
+
+        void embeddings_gradient(
+            const tensor& prev,
+            const tensor& gradient_input,
+            tensor& grads,
+            const tensor& freqs,
+            float learning_rate,
+            bool scale
+        )
+        {
+            DLIB_CASSERT(
+                prev.nr() > 0 &&
+                gradient_input.num_samples() == prev.num_samples() &&
+                gradient_input.k() == prev.k() &&
+                gradient_input.nr() == prev.nr() &&
+                gradient_input.nc() == grads.k() &&
+                grads.num_samples() > 0 &&
+                grads.k() > 0 &&
+                grads.nr() == 1 &&
+                grads.nc() == 1,
+                "\ngradient_input.num_samples(): " << gradient_input.num_samples() <<
+                "\ngradient_input.k(): " << gradient_input.k() <<
+                "\ngradient_input.nr(): " << gradient_input.nr() <<
+                "\ngradient_input.nc(): " << gradient_input.nc() <<
+                "\nprev.num_samples(): " << prev.num_samples() <<
+                "\nprev.k(): " << prev.k() <<
+                "\nprev.nr(): " << prev.nr() <<
+                "\nprev.nc(): " << prev.nc() <<
+                "\ngrads.num_samples(): " << grads.num_samples() <<
+                "\ngrads.k(): " << grads.k() <<
+                "\ngrads.nr(): " << grads.nr() <<
+                "\ngrads.nc(): " << grads.nc()
+            );
+            
+            const long sk = gradient_input.k();
+            const long sr = gradient_input.nr();
+            const long sc = gradient_input.nc();
+
+            launch_kernel(_cuda_embeddings_gradient, gradient_input.size(), sk, sr, sc,
+                prev.device(), gradient_input.device(), grads.device(), freqs.device(),
+                learning_rate, scale, grads.num_samples());
+        }
+
+    // ----------------------------------------------------------------------------------------
+
         __global__ void _cuda_layer_normalize(
             float* out,
             const float* s,
@@ -2503,6 +2687,77 @@ namespace dlib
             }
         }
 
+        __global__ void _cuda_copy_strided_tensor_add_to (float* dest, const float* src, 
+                                                        size_t ns, size_t nk, size_t nr, size_t nc,
+                                                        size_t dk, size_t dr, size_t dc,
+                                                        size_t sk, size_t sr, size_t sc)
+        {
+            for(auto i : grid_stride_range(0, ns*nk*nr*nc)) 
+            {
+                size_t n,k,r,c;
+                unpack_idx(i, nk,nr,nc, n,k,r,c);
+                dest[pack_idx(dk,dr,dc, n,k,r,c)] += src[pack_idx(sk,sr,sc, n,k,r,c)];
+            }
+        }
+
+        __global__ void _cuda_copy_strided_tensor (float* dest, const float* src,
+                                                   size_t ns, size_t nk, size_t nr, size_t nc,
+                                                   size_t dk, size_t dr, size_t dc,
+                                                   size_t sk, size_t sr, size_t sc)
+        {
+            for(auto i : grid_stride_range(0, ns*nk*nr*nc)) 
+            {
+                size_t n,k,r,c;
+                unpack_idx(i, nk,nr,nc, n,k,r,c);
+                dest[pack_idx(dk,dr,dc, n,k,r,c)] = src[pack_idx(sk,sr,sc, n,k,r,c)];
+            }
+        }
+
+       void copy_tensor(
+            bool add_to,
+            tensor& dest,
+            size_t dk, size_t dnr, size_t dnc,
+            const tensor& src,
+            size_t sk, size_t snr, size_t snc,
+            size_t k, size_t nr, size_t nc
+        )
+        {
+
+            DLIB_CASSERT(dest.num_samples() == src.num_samples(), "All sources should fit into dest tensor size");
+            DLIB_CASSERT(dest.k() - dk >= k &&
+                dest.nr() - dnr >= nr &&
+                dest.nc() - dnc >= nc, "Not enough space in dest tensor");
+            DLIB_CASSERT(src.k() - sk >= k &&
+                src.nr() - snr >= nr &&
+                src.nc() - snc >= nc, "Not enough space in src tensor");
+
+            float* dest_p = dest.device() + dk * static_cast<size_t>(dest.nc() * dest.nr()) \
+                                          + dnr * static_cast<size_t>(dest.nc()) \
+                                          + dnc;
+
+            const float* src_p = src.device() + sk * static_cast<size_t>(src.nc() * src.nr()) \
+                                              + snr * static_cast<size_t>(src.nc()) \
+                                              + snc;
+
+            if (add_to)
+            {
+                launch_kernel(_cuda_copy_strided_tensor_add_to, max_jobs(dest.size()), 
+                              dest_p, src_p, dest.num_samples(),
+                              k, nr, nc,
+                              dest.k(), dest.nr(), dest.nc(),
+                              src.k(), src.nr(), src.nc());
+            }
+            else
+            {
+                launch_kernel(_cuda_copy_strided_tensor, max_jobs(dest.size()), 
+                              dest_p, src_p, dest.num_samples(),
+                              k, nr, nc,
+                              dest.k(), dest.nr(), dest.nc(),
+                              src.k(), src.nr(), src.nc());
+            }
+        }
+
+
     // ----------------------------------------------------------------------------------------
 
         __global__ void _cuda_transpose(size_t dsize, size_t dk, size_t dnr, size_t dnc, float* d,
@@ -2540,6 +2795,273 @@ namespace dlib
             launch_kernel(_cuda_transpose, max_jobs(dest.size()), dest.size(),
                 dest.k(), dest.nr(), dest.nc(), dest.device(),
                 src.k(), src.nr(), src.nc(), src.device(), add_to);
+        }
+
+    // ----------------------------------------------------------------------------------------
+
+        // CUDA Kernels for ACT operations
+        __global__ void _cuda_compute_act_halt_probabilities(
+            float* halt_probs,
+            float* logits,
+            const float* input_data,
+            const float* W_halt,
+            float b_halt,
+            size_t batch_size,
+            size_t seq_len,
+            size_t d_model,
+            size_t num_channels,
+            size_t feature_dim
+        )
+        {
+            const long total_positions = batch_size * seq_len;
+
+            for (auto pos : grid_stride_range_y(0, total_positions))
+                for (auto i : grid_stride_range(0, 1))
+                    logits[pos] = b_halt;
+            __syncthreads();
+
+            for (auto pos : grid_stride_range_y(0, total_positions))
+            {
+                const long n = pos / seq_len;
+                const long s = pos % seq_len;
+
+                float temp = 0;
+                for (auto feat_idx : grid_stride_range(0, feature_dim))
+                {
+                    const long c = feat_idx / d_model;
+                    const long d = feat_idx % d_model;
+
+                    const long in_idx = ((n * num_channels + c) * seq_len + s) * d_model + d;
+                    temp += input_data[in_idx] * W_halt[feat_idx];
+                }
+
+                warp_reduce_atomic_add(logits[pos], temp);
+            }
+            __syncthreads();
+
+            for (auto pos : grid_stride_range(0, total_positions))
+            {
+                halt_probs[pos] = 1.0f / (1.0f + expf(-logits[pos]));
+            }
+        }
+
+        void compute_act_halt_probabilities(
+            resizable_tensor& halt_probs,
+            resizable_tensor& logits,
+            const tensor& input_data,
+            const tensor& halt_params,
+            long batch_size,
+            long seq_len,
+            long feature_dim
+        )
+        {
+            const long total_positions = batch_size * seq_len;
+            const long d_model = feature_dim / input_data.k();
+            const long num_channels = input_data.k();
+
+            halt_probs.set_size(total_positions, 1, 1, 1);
+            logits.set_size(total_positions, 1, 1, 1);
+
+            launch_kernel(_cuda_compute_act_halt_probabilities,
+                max_jobs(feature_dim, total_positions),
+                halt_probs.device(),
+                logits.device(),
+                input_data.device(),
+                halt_params.device(),
+                halt_params.host()[feature_dim],
+                batch_size,
+                seq_len,
+                d_model,
+                num_channels,
+                feature_dim);
+        }
+
+        __global__ void _cuda_update_act_state(
+            float* output,
+            const float* input_data,
+            const float* halt_probs,
+            float* cumulative_halting,
+            float* remainders,
+            float* n_steps,
+            float* effective_weights,
+            size_t batch_size,
+            size_t seq_len,
+            size_t d_model,
+            size_t num_channels,
+            float halt_threshold,
+            long current_step
+        )
+        {
+            for (auto pos : grid_stride_range(0, batch_size * seq_len))
+            {
+                if (cumulative_halting[pos] < halt_threshold)
+                {
+                    const size_t n = pos / seq_len;
+                    const size_t s = pos % seq_len;
+
+                    float p = halt_probs[pos];
+                    float r = remainders[pos];
+                    float effective = fminf(p * r, halt_threshold - cumulative_halting[pos]);
+
+                    cumulative_halting[pos] += effective;
+                    remainders[pos] -= effective;
+                    n_steps[pos] = static_cast<float>(current_step + 1);
+                    effective_weights[pos] += effective;
+
+                    for (size_t c = 0; c < num_channels; ++c) {
+                        for (size_t d = 0; d < d_model; ++d) {
+                            const size_t idx = ((n * num_channels + c) * seq_len + s) * d_model + d;
+                            output[idx] += effective * input_data[idx];
+                        }
+                    }
+                }
+            }
+        }
+
+        void update_act_state(
+            resizable_tensor& output,
+            const tensor& input_data,
+            const tensor& halt_probs,
+            resizable_tensor& cumulative_halting,
+            resizable_tensor& remainders,
+            resizable_tensor& n_steps,
+            resizable_tensor& effective_weights,
+            long batch_size,
+            long seq_len,
+            long d_model,
+            long num_channels,
+            float halt_threshold,
+            long current_step
+        )
+        {
+            const long total_positions = batch_size * seq_len;
+
+            launch_kernel(_cuda_update_act_state,
+                max_jobs(total_positions),
+                output.device(),
+                input_data.device(),
+                halt_probs.device(),
+                cumulative_halting.device(),
+                remainders.device(),
+                n_steps.device(),
+                effective_weights.device(),
+                batch_size,
+                seq_len,
+                d_model,
+                num_channels,
+                halt_threshold,
+                current_step);
+        }
+
+        __global__ void _cuda_finalize_act_output(
+            float* output,
+            const float* input_data,
+            const float* remainders,
+            float* effective_weights,
+            size_t batch_size,
+            size_t seq_len,
+            size_t d_model,
+            size_t num_channels
+        )
+        {
+            for (auto pos : grid_stride_range(0, batch_size * seq_len))
+            {
+                float r = remainders[pos];
+                if (r > 1e-6f) {
+                    const size_t n = pos / seq_len;
+                    const size_t s = pos % seq_len;
+
+                    effective_weights[pos] += r;
+
+                    for (size_t c = 0; c < num_channels; ++c) {
+                        for (size_t d = 0; d < d_model; ++d) {
+                            const size_t idx = ((n * num_channels + c) * seq_len + s) * d_model + d;
+                            output[idx] += r * input_data[idx];
+                        }
+                    }
+                }
+            }
+        }
+
+        void finalize_act_output(
+            resizable_tensor& output,
+            const tensor& input_data,
+            const tensor& remainders,
+            resizable_tensor& effective_weights,
+            long batch_size,
+            long seq_len,
+            long d_model,
+            long num_channels
+        )
+        {
+            const long total_positions = batch_size * seq_len;
+
+            launch_kernel(_cuda_finalize_act_output,
+                max_jobs(total_positions),
+                output.device(),
+                input_data.device(),
+                remainders.device(),
+                effective_weights.device(),
+                batch_size,
+                seq_len,
+                d_model,
+                num_channels);
+        }
+
+        __global__ void _cuda_apply_act_depth_scaling(
+            float* gradients,
+            const float* n_steps,
+            size_t batch_size,
+            size_t seq_len,
+            size_t d_model,
+            size_t num_channels,
+            float max_steps,
+            float scale_factor
+        )
+        {
+            const long total_positions = batch_size * seq_len;
+            const long feature_dim = num_channels * d_model;
+
+            for (auto pos : grid_stride_range_y(0, total_positions))
+            {
+                const long n = pos / seq_len;
+                const long s = pos % seq_len;
+                const float scale = 1.0f + scale_factor * (n_steps[pos] / max_steps);
+
+                for (auto feat_idx : grid_stride_range(0, feature_dim))
+                {
+                    const long c = feat_idx / d_model;
+                    const long d = feat_idx % d_model;
+                    const long idx = ((n * num_channels + c) * seq_len + s) * d_model + d;
+                    gradients[idx] *= scale;
+                }
+            }
+        }
+
+        void apply_act_depth_scaling(
+            tensor& gradients,
+            const tensor& n_steps,
+            long batch_size,
+            long seq_len,
+            long d_model,
+            long num_channels,
+            float max_steps,
+            float scale_factor
+        )
+        {
+            const long total_positions = batch_size * seq_len;
+            const long feature_dim = num_channels * d_model;
+
+            launch_kernel(_cuda_apply_act_depth_scaling,
+                max_jobs(feature_dim, total_positions),
+                gradients.device(),
+                n_steps.device(),
+                batch_size,
+                seq_len,
+                d_model,
+                num_channels,
+                max_steps,
+                scale_factor);
         }
 
     // ----------------------------------------------------------------------------------------
@@ -2762,4 +3284,3 @@ namespace dlib
 
     }
 }
-

@@ -1,5 +1,5 @@
 
-CMAKE_MINIMUM_REQUIRED(VERSION 3.8.0)
+CMAKE_MINIMUM_REQUIRED(VERSION 3.17.0)
 
 if (WIN32 AND NOT "${CMAKE_GENERATOR}" MATCHES "Visual Studio") 
    message(FATAL_ERROR "\n"
@@ -13,13 +13,6 @@ endif()
 
 project(dlib_python_bindings)
 
-# Pybind11's cmake scripts enable link time optimization by default.  However,
-# it makes linking take a really long time and doesn't seem to substantively
-# improve runtime performance.  So we disable LTO here to make building dlib
-# faster.
-set(PYBIND11_LTO_CXX_FLAGS "")
-
-
 # Avoid cmake warnings about changes in behavior of some Mac OS X path 
 # variable we don't care about.
 if (POLICY CMP0042)
@@ -27,13 +20,6 @@ if (POLICY CMP0042)
 endif()
 
 
-# To avoid dll hell, always link everything statically when compiling in
-# visual studio.  This way, the resulting library won't depend on a bunch
-# of other dll files and can be safely copied to someone else's computer
-# and expected to run.
-if (MSVC)
-    include(${CMAKE_CURRENT_LIST_DIR}/../../dlib/cmake_utils/tell_visual_studio_to_use_static_runtime.cmake)
-endif()
 
 add_subdirectory(../../dlib/external/pybind11 pybind11_build)
 add_subdirectory(../../dlib dlib_build)
@@ -74,6 +60,11 @@ if(NOT ${DLIB_NO_GUI_SUPPORT})
    list(APPEND python_srcs src/gui.cpp)
 endif()
 
+# Pybind11 enables link time optimization by default.  It makes linking take a
+# long time and doesn't substantively improve runtime performance for dlib's
+# Python module, so explicitly disable it while retaining pybind11's other
+# platform-specific build extras.
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
 pybind11_add_module(_dlib_pybind11 ${python_srcs})
 target_link_libraries(_dlib_pybind11 PRIVATE dlib::dlib)
 
